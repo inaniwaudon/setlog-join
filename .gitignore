@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+.labels/
+assets/
+boundaries/
+output.mp4
+face.txt
+*.onnx
+
+.DS_Store
+.env
