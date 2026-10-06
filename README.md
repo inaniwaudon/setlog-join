@@ -1,20 +1,38 @@
-# setlog
+# setlog-join
 
-`assets/setlog-MMDD.mp4` を日付順に結合して `output.mp4` を作る。
+setlog の動画を日付順に結合するスクリプトです．
+人物の顔が映っているクリップ（2秒の動画）を検出して，ぼかしを加えたり，削除したりすることもできます．
 
 ## コマンド
 
+```bash
+# assets/setlog-YYMM.mp4 を読み込んで，output.mp4 を生成
+python main.py
+```
+
 | コマンド | 説明 |
 | --- | --- |
-| `python main.py` | クリップを結合して `output.mp4` を書き出す。 |
-| `python main.py --blur` | `face.txt` に記載のセグメントを `boxblur` でぼかして結合。 |
-| `python main.py --blur --test` | 各セグメントに `clip/n` ラベルを重畳（境界確認用）。 |
-| `python main.py --face` | YuNet で各セグメントの顔を検出し `face.txt` を生成。 |
-| `python main.py --boundary` | `face.txt` のぼかし対象セグメントについて、元クリップから境界フレーム±2 を横並び PNG で `boundaries/` に書き出す。シーン切替検出がフレーム単位で正しいかの目視確認用。 |
+| （オプションなし） | 各ファイルを結合する |
+| `--blur` | `face.txt` に記載のクリップにぼかしを加える．結合完了後，ぼかし境界の前後 ±2 フレーム（計 5 枚）を `boundaries/` に出力する |
+| `--clip` | `face.txt` に記載のクリップを削除する |
+| `--test` | 各セグメントに `filename/clipindex` ラベルを重畳する |
+| `--face` | YuNet で各セグメントの顔を検出して `face.txt` を生成する |
 
-## 流れ
+## 使用方法
 
-1. `--face` で顔検出して `face.txt` を作成
-2. 必要に応じて手動で `face.txt` を編集
-3. `--blur` で `output.mp4` を生成
-4. `--boundary` で境界フレーム（±2）を書き出し、シーン切替位置がフレーム単位で正しいか目視確認。
+1. setlog アプリから日付ごとの動画を書き出す
+2. assets/setlog-YYMM.mp4 に動画を配置する
+3. スクリプトを実行する
+
+### 顔検出してぼかしを加える場合
+
+1. `--face` で顔検出して `face.txt` を作成する
+2. 必要に応じて手動で `face.txt` を編集する
+3. `--blur` オプション付きでスクリプトを実行する
+4. `boundaries/` に境界フレームが出力されるので、適切にぼかしが掛かっているかを目視確認する
+
+### 顔検出してクリップを加える場合
+
+1. `--face` で顔検出して `face.txt` を作成する
+2. 必要に応じて手動で `face.txt` を編集する
+3. `--clip` オプション付きでスクリプトを実行する

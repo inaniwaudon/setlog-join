@@ -7,7 +7,7 @@ venv/
 .labels/
 assets/
 boundaries/
-output.mp4
+output*.mp4
 face.txt
 *.onnx
 

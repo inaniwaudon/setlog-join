@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""assets/ 配下の setlog-MMDD.mp4 を日付順に結合して output.mp4 を作る。"""
 from __future__ import annotations
 
+import math
 import re
 import subprocess
 import sys
@@ -11,28 +11,31 @@ ASSETS = Path(__file__).parent / "assets"
 OUTPUT = Path(__file__).parent / "output.mp4"
 FACE_TXT = Path(__file__).parent / "face.txt"
 BOUNDARIES_DIR = Path(__file__).parent / "boundaries"
-# --boundary で検出境界フレームの前後に書き出すフレーム数（±N）。
-BOUNDARY_CONTEXT_FRAMES = 2
-YUNET_MODEL = Path(__file__).parent / "face_detection_yunet_2023mar.onnx"
-PATTERN = re.compile(r"setlog-(\d{4})\.mp4$")
-SPEED = 3.0
-# 各セグメントの公称秒数（素材が n×NOMINAL_SEGMENT_SEC で構成されている前提）。
-NOMINAL_SEGMENT_SEC = 2.0
-# 各セグメントから抽出するサンプル数。等間隔で抜いて検出に回す。
-SAMPLES_PER_SEGMENT = 5
-# YuNet の信頼度しきい値。
-FACE_SCORE_THRESHOLD = 0.6
-# 期待境界の前後何秒を実境界探索窓とするか。
-SCENE_SEARCH_WINDOW_SEC = 0.5
-# シーン切替検出用のダウンスケール解像度（NxN）。全画面の粗い差分で判定する。
-SCENE_DIFF_SIZE = 32
-# boxblur の半径（px）。
+
+# 出力速度
+SPEED = 2.0
+# ぼかし半径（px）
 BLUR_RADIUS = 35
-# --test で重畳するテキスト用フォントと生成 PNG 置き場。
+
+# --test で重畳するテキスト用フォントと生成 PNG 置き場
 TEST_FONT = "/System/Library/Fonts/Supplemental/Arial.ttf"
 TEST_LABEL_DIR = Path(__file__).parent / ".labels"
 TEST_FONT_SIZE = 28
 
+# --boundary で検出境界フレームの前後に書き出すフレーム数（±N）
+BOUNDARY_CONTEXT_FRAMES = 2
+YUNET_MODEL = Path(__file__).parent / "face_detection_yunet_2023mar.onnx"
+PATTERN = re.compile(r"setlog-(\d{4})\.mp4$")
+# 各セグメントの公称秒数（素材が n×NOMINAL_SEGMENT_SEC で構成されている前提）
+NOMINAL_SEGMENT_SEC = 2.0
+# 各セグメントから抽出するサンプル数．等間隔で抜いて検出に回す
+SAMPLES_PER_SEGMENT = 5
+# YuNet の信頼度しきい値
+FACE_SCORE_THRESHOLD = 0.6
+# 期待境界の前後何秒を実境界探索窓とするか
+SCENE_SEARCH_WINDOW_SEC = 0.5
+# シーン切替検出用のダウンスケール解像度（NxN）．全画面の粗い差分で判定する
+SCENE_DIFF_SIZE = 32
 
 def collect() -> list[Path]:
     files = []
@@ -45,7 +48,7 @@ def collect() -> list[Path]:
 
 
 def scene_segments(clip: Path) -> tuple[list[tuple[float, float]], float]:
-    """全画面ダウンスケール差分で切替フレームを拾い、(start,end) 秒のリストと fps を返す。"""
+    """全画面ダウンスケール差分で切替フレームを拾い，(start,end) 秒のリストと fps を返す．"""
     import cv2  # noqa: PLC0415
 
     cap = cv2.VideoCapture(str(clip))
@@ -59,8 +62,8 @@ def scene_segments(clip: Path) -> tuple[list[tuple[float, float]], float]:
 
     duration = total / fps
 
-    # タイマー ROI だけだと素材内の動き（手や人物が通過する動きブラー）で偽ピークが立つため、
-    # 画面全体をダウンスケールしたフレーム差分でシーン切替を検出する。
+    # タイマー ROI だけだと素材内の動き（手や人物が通過する動きブラー）で偽ピークが立つため，
+    # 画面全体をダウンスケールしたフレーム差分でシーン切替を検出する
     diffs = [0] * total
     prev = None
     for idx in range(total):
@@ -73,7 +76,7 @@ def scene_segments(clip: Path) -> tuple[list[tuple[float, float]], float]:
         prev = small
     cap.release()
 
-    # 公称セグメント数 n を推定し、各期待境界フレーム近傍で diff 最大のフレームを採用。
+    # 公称セグメント数 n を推定し，各期待境界フレーム近傍で diff 最大のフレームを採用
     n = max(1, int(round(duration / NOMINAL_SEGMENT_SEC)))
     window = max(1, int(SCENE_SEARCH_WINDOW_SEC * fps))
     boundaries: list[int] = []
@@ -125,38 +128,63 @@ def make_label_png(text: str) -> Path:
     return out
 
 
-def main(blur: bool = False, test: bool = False) -> int:
+def main(blur: bool = False, test: bool = False, clip: bool = False) -> int:
     clips = collect()
     if not clips:
         print("no clips found in assets/", file=sys.stderr)
         return 1
 
-    blur_map = load_blur_map() if blur else {}
+    if clip and blur:
+        print("--clip and --blur are mutually exclusive", file=sys.stderr)
+        return 1
+
+    blur_map = load_blur_map() if (blur or clip) else {}
 
     inputs: list[str] = []
     for p in clips:
         inputs += ["-i", str(p)]
 
-    # --test 用のラベル PNG を追加入力として積む（clip_index, seg_index -> ffmpeg 入力 index）。
+    # --test 用のラベル PNG を追加入力として積む（clip_index, seg_index -> ffmpeg 入力 index）
     label_inputs: dict[tuple[int, int], int] = {}
 
     pre_filters: list[str] = []
     concat_labels: list[str] = []
+    # ぼかし生成時に使った (segments, blur_segs, duration) を控えておき，後段の境界ダンプで再利用する
+    per_clip_info: list[tuple[list[tuple[float, float]], set[int], float]] = []
+
     for i, p in enumerate(clips):
         src = f"[{i}:v:0]"
-        segs = blur_map.get(p.name, []) if blur else []
-        need_segs = bool(segs) or (test and blur)
+        segs = blur_map.get(p.name, []) if (blur or clip) else []
+        need_segs = bool(segs) or (test and blur) or blur or clip
         ranges_sec: list[tuple[float, float]] = []
         fps = 0.0
         if need_segs:
             ranges_sec, fps = scene_segments(p)
+        per_clip_info.append((ranges_sec, set(segs), ranges_sec[-1][1] if ranges_sec else 0.0))
+
+        if clip and ranges_sec:
+            keep = [(n, s, e) for n, (s, e) in enumerate(ranges_sec, start=1) if n not in set(segs)]
+            if not keep:
+                print(f"{p.name}: all segments excluded by --clip; skipping", file=sys.stderr)
+                continue
+            trim_labels: list[str] = []
+            for n, s, e in keep:
+                lbl = f"[c{i}_{n}]"
+                pre_filters.append(
+                    f"{src}trim=start={s:.6f}:end={e:.6f},setpts=PTS-STARTPTS{lbl}"
+                )
+                trim_labels.append(lbl)
+            joined = f"[c{i}]"
+            pre_filters.append(
+                f"{''.join(trim_labels)}concat=n={len(trim_labels)}:v=1:a=0{joined}"
+            )
+            concat_labels.append(joined)
+            continue
 
         cur = src
         if segs:
-            # 検出境界が1フレーム程度ずれる余地があるので前後1フレーム分広げてぼかす。
-            pad = (1.0 / fps) if fps > 0 else 0.0
             parts_r = [
-                f"between(t,{max(0.0, ranges_sec[n-1][0] - pad):.6f},{ranges_sec[n-1][1] + pad:.6f})"
+                f"between(t,{ranges_sec[n-1][0]:.6f},{ranges_sec[n-1][1]:.6f})"
                 for n in segs if 1 <= n <= len(ranges_sec)
             ]
             if parts_r:
@@ -178,9 +206,12 @@ def main(blur: bool = False, test: bool = False) -> int:
 
         concat_labels.append(cur)
 
+    if not concat_labels:
+        print("no segments to concatenate", file=sys.stderr)
+        return 1
     concat_in = "".join(concat_labels)
     parts = list(pre_filters)
-    parts.append(f"{concat_in}concat=n={len(clips)}:v=1:a=0[cv]")
+    parts.append(f"{concat_in}concat=n={len(concat_labels)}:v=1:a=0[cv]")
     if SPEED != 1.0:
         parts.append(f"[cv]setpts=PTS/{SPEED}[v]")
         out_label = "[v]"
@@ -195,9 +226,15 @@ def main(blur: bool = False, test: bool = False) -> int:
         "-an",
         str(OUTPUT),
     ]
-    print("concatenating:", *[p.name for p in clips], "(blur)" if blur else "")
+    mode = "(blur)" if blur else "(clip)" if clip else ""
+    print("concatenating:", *[p.name for p in clips], mode)
     result = subprocess.run(cmd)
-    return result.returncode
+    if result.returncode != 0:
+        return result.returncode
+
+    if blur:
+        dump_boundaries_from_output(clips, per_clip_info)
+    return 0
 
 
 def detect_faces() -> int:
@@ -256,70 +293,86 @@ def detect_faces() -> int:
     return 0
 
 
-def dump_boundaries() -> int:
-    """各クリップの検出境界フレーム±BOUNDARY_CONTEXT_FRAMES を横並びにして1枚ずつ書き出す。"""
+def dump_boundaries_from_output(
+    clips: list[Path],
+    per_clip_info: list[tuple[list[tuple[float, float]], set[int], float]],
+) -> None:
+    """output.mp4 から，少なくとも片側がぼかし対象の境界について
+    前後 ±BOUNDARY_CONTEXT_FRAMES を横並びに書き出す．
+    生成時に使った segments と blur_segs をそのまま再利用するので，ずれの心配がない．"""
     import cv2  # noqa: PLC0415
     import numpy as np  # noqa: PLC0415
 
-    clips = collect()
-    if not clips:
-        print("no clips found in assets/", file=sys.stderr)
-        return 1
-
-    blur_map = load_blur_map()
-    if not blur_map:
-        return 1
+    cap = cv2.VideoCapture(str(OUTPUT))
+    if not cap.isOpened():
+        print(f"cannot open {OUTPUT.name} for boundary dump", file=sys.stderr)
+        return
+    out_fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
+    out_total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    if out_fps <= 0 or out_total <= 0:
+        print(f"invalid metadata for {OUTPUT.name}", file=sys.stderr)
+        cap.release()
+        return
 
     BOUNDARIES_DIR.mkdir(exist_ok=True)
     offsets = list(range(-BOUNDARY_CONTEXT_FRAMES, BOUNDARY_CONTEXT_FRAMES + 1))
-    for clip in clips:
-        blur_segs = set(blur_map.get(clip.name, []))
-        if not blur_segs:
+
+    cumulative_src_sec = 0.0
+    total_dumped = 0
+    for clip, (segments, blur_segs, clip_duration) in zip(clips, per_clip_info):
+        if not segments:
             continue
-        segments, fps = scene_segments(clip)
-        if not segments or fps <= 0:
-            print(f"invalid metadata for {clip.name}", file=sys.stderr)
-            continue
-        boundary_frames = [int(round(s * fps)) for s, _ in segments[1:]]
-        cap = cv2.VideoCapture(str(clip))
-        if not cap.isOpened():
-            print(f"cannot open {clip.name}", file=sys.stderr)
-            continue
-        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
-        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
         dumped = 0
-        for k, bf in enumerate(boundary_frames, start=2):
-            # セグメント (k-1) と k の境界。少なくとも片方がぼかし対象のときだけ書き出す。
-            if (k - 1) not in blur_segs and k not in blur_segs:
+        for k, (seg_start_src, _) in enumerate(segments[1:], start=2):
+            left_blur = (k - 1) in blur_segs
+            right_blur = k in blur_segs
+            if not (left_blur or right_blur):
                 continue
-            dumped += 1
+            # ffmpeg は setpts=PTS/SPEED で縮んだストリームを出力 fps=ソース fps に落とすので，
+            # 出力フレーム k は概ねソースフレーム round(k*SPEED) を映す．
+            # ラベル位置 bf は「初めて境界以降のソースフレームが映る出力フレーム」=
+            # ceil((bf_src - 0.5) / SPEED) 相当．out_fps をソース fps の代理として使う．
+            total_src_sec = cumulative_src_sec + seg_start_src
+            bf_src = total_src_sec * out_fps  # out_fps ≈ src_fps と仮定
+            bf = max(0, int(math.ceil((bf_src - 0.5) / SPEED)))
+
             tiles = []
             for off in offsets:
                 fr = bf + off
-                if 0 <= fr < total:
+                if 0 <= fr < out_total:
                     cap.set(cv2.CAP_PROP_POS_FRAMES, fr)
                     ok, frame = cap.read()
                     tile = frame if ok else np.zeros((h, w, 3), dtype=np.uint8)
                 else:
                     tile = np.zeros((h, w, 3), dtype=np.uint8)
-                # 境界フレーム (off=0) は赤枠、他は白枠で見分けやすく。
                 color = (0, 0, 255) if off == 0 else (255, 255, 255)
                 cv2.rectangle(tile, (0, 0), (tile.shape[1] - 1, tile.shape[0] - 1), color, 6)
-                cv2.putText(tile, f"{off:+d}", (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 2.0, color, 4)
+                if off < 0:
+                    expect = "BLUR" if left_blur else "clean"
+                elif off > 0:
+                    expect = "BLUR" if right_blur else "clean"
+                else:
+                    expect = "boundary"
+                cv2.putText(tile, f"{off:+d} {expect}", (20, 60),
+                            cv2.FONT_HERSHEY_SIMPLEX, 2.0, color, 4)
                 tiles.append(tile)
             strip = np.hstack(tiles)
             out = BOUNDARIES_DIR / f"{clip.stem}_seg{k}.png"
             cv2.imwrite(str(out), strip)
-        cap.release()
-        print(f"{clip.name}: dumped {dumped} boundaries")
-    return 0
+            dumped += 1
+        cumulative_src_sec += clip_duration
+        if dumped:
+            print(f"{clip.name}: dumped {dumped} boundaries")
+        total_dumped += dumped
+
+    cap.release()
+    print(f"wrote {total_dumped} boundary strips to {BOUNDARIES_DIR.name}/")
 
 
 if __name__ == "__main__":
     args = sys.argv[1:]
     if "--face" in args:
         sys.exit(detect_faces())
-    if "--boundary" in args:
-        sys.exit(dump_boundaries())
-    sys.exit(main(blur="--blur" in args, test="--test" in args))
+    sys.exit(main(blur="--blur" in args, test="--test" in args, clip="--clip" in args))
